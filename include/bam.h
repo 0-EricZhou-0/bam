@@ -12,30 +12,32 @@
  *   #include <bam.h>
  *
  *   // Open NVMe controller and create I/O queue pairs on GPU 0
- *   Controller ctrl("/dev/libnvm0", /*ns_id=*/ 1, /*cudaDevice=*/ 0,
- *                    /*queueDepth=*/ 1024, /*numQueues=*/ 128);
+ *   Controller ctrl("/dev/libnvm0", 1, 0, 1024, 128);
  *
- *   // Allocate a DMA-mapped GPU buffer (e.g. 16 pages)
- *   BamBuffer buf(ctrl, 16 * ctrl.page_size);
+ *   // Allocate a DMA-mapped GPU buffer with PRP list pool for multi-page I/O
+ *   BamBuffer buf(ctrl, 16 * 1024 * 1024, 256);  // 16MB data, 256 PRP slots
  *
- * Device-side I/O (inside CUDA kernel):
+ * Device-side I/O (inside CUDA kernel, buf.d_buf passed as kernel arg):
  *   // Each warp picks a queue pair round-robin
- *   uint32_t qid = (threadIdx.x + blockIdx.x * blockDim.x) / 32 % ctrl->n_qps;
- *   QueuePair* qp = ctrl->d_qps + qid;
+ *   uint32_t qid = (threadIdx.x + blockIdx.x * blockDim.x) / 32 % n_qps;
+ *   QueuePair* qp = d_qps + qid;
  *
- *   // Synchronous read: thread blocks until data is in GPU memory
- *   bam_read(qp, lba, n_blocks, buf.d_ioaddrs[page_idx]);
+ *   // Single-page read (raw PRP API):
+ *   bam_read(qp, lba, n_blocks, d_buf->ioaddrs[page_idx]);
  *
- *   // Asynchronous read: submit and complete separately
+ *   // Multi-page read (8 consecutive pages in one NVMe command):
+ *   bam_read_pages(qp, start_lba, d_buf, start_page, 8);
+ *
+ *   // Asynchronous single-page read:
  *   uint16_t cid;
- *   bam_read_async(qp, lba, n_blocks, buf.d_ioaddrs[page_idx], 0, &cid);
+ *   bam_read_async(qp, lba, n_blocks, d_buf->ioaddrs[page_idx], 0, &cid);
  *   // ... do other work ...
  *   bam_complete(qp, cid);
  *
  * Headers included:
  *   ctrl.h    -- Controller: host-side NVMe controller and queue pair setup
- *   buffer.h  -- BamBuffer: DMA-mapped GPU buffer with device-accessible ioaddrs
- *   bam_io.h  -- bam_read, bam_write, bam_complete: device-side I/O functions
+ *   buffer.h  -- BamBuffer + bam_buf_t: DMA-mapped GPU buffer with PRP pool
+ *   bam_io.h  -- bam_read, bam_write, bam_read_pages, etc.: device-side I/O
  */
 
 #include "ctrl.h"
