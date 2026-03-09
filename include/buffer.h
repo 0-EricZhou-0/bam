@@ -48,6 +48,35 @@ struct Controller;
 
 
 /*
+ * bam_buf_t -- Device-side BamBuffer descriptor for GPU kernels.
+ *
+ * Passed to bam_read_pages/bam_write_pages as a device pointer.
+ * Contains the physical IO addresses of data pages plus a PRP list
+ * pool for multi-page (>2) transfers.
+ *
+ * The PRP list pool is a set of pre-allocated DMA-mapped pages, each
+ * capable of holding page_size/8 PRP entries. A lock-bit allocator
+ * (same pattern as get_cid/put_cid in nvm_parallel_queue.h) distributes
+ * slots to GPU threads on demand.
+ */
+struct bam_buf_t {
+    uint64_t*      ioaddrs;          /* Physical addresses of data pages       */
+    uint8_t*       base_addr;        /* GPU virtual address of buffer data     */
+    uint32_t       page_size;        /* Controller page size in bytes          */
+    uint32_t       n_pages;          /* Total number of data pages             */
+
+    /* PRP list pool for multi-page transfers */
+    uint64_t*      prp_list_ioaddrs; /* Physical addr of each PRP list page    */
+    uint8_t*       prp_list_base;    /* GPU vaddr base of PRP list DMA region  */
+    padded_struct* prp_slots;        /* Lock-bit allocator array [pool_size]   */
+    uint32_t       prp_pool_size;    /* Number of PRP list slots (0=disabled)  */
+    uint32_t       prp_page_size;    /* Size of each PRP list page (=page_size)*/
+
+    simt::atomic<uint32_t, simt::thread_scope_device> prp_ticket;
+};
+
+
+/*
  * getDeviceMemory -- Allocate GPU memory with 64KB alignment for DMA.
  *
  * Allocates @size + 64KB bytes via cudaMalloc, then aligns the returned
@@ -254,20 +283,28 @@ inline BufferPtr createBuffer(size_t size, int cudaDevice)
 
 
 /*
- * BamBuffer -- GPU-accessible DMA buffer for use with bam_read/bam_write.
+ * BamBuffer -- GPU-accessible DMA buffer for use with bam I/O functions.
  *
  * Wraps a DMA allocation on a specific CUDA device and copies the physical
- * IO addresses (ioaddrs) to device memory so that GPU threads can pass them
- * directly to bam_read() / bam_write() as prp1/prp2 arguments.
+ * IO addresses (ioaddrs) to device memory so that GPU threads can use them
+ * with bam_read/bam_write (single-page) or bam_read_pages/bam_write_pages
+ * (multi-page).
+ *
+ * When prp_pool_size > 0, the buffer also allocates a pool of DMA-mapped
+ * PRP list pages for multi-page (>2) NVMe transfers. Each PRP list page
+ * holds page_size/8 entries, supporting transfers up to
+ * (page_size/8 + 1) pages per command.
  *
  * Host-side setup:
  *   Controller ctrl("/dev/libnvm0", ns_id, cuda_device, queue_depth, num_queues);
- *   BamBuffer buf(ctrl, total_bytes);
+ *   BamBuffer buf(ctrl, 16*1024*1024, 256);  // 16MB data, 256 PRP list slots
  *
  * Device-side usage (inside CUDA kernel):
- *   uint64_t prp1 = buf.d_ioaddrs[page_index];
- *   bam_read(qp, lba, n_blocks, prp1, 0);
- *   // Data is now at ((uint8_t*)buf.vaddr) + page_index * buf.page_size
+ *   // Single-page read (raw API):
+ *   bam_read(qp, lba, n_blocks, buf.d_buf->ioaddrs[page_idx], 0);
+ *
+ *   // Multi-page read (8 consecutive pages):
+ *   bam_read_pages(qp, start_lba, buf.d_buf, start_page, 8);
  */
 struct BamBuffer {
     DmaPtr    dma;          /* DMA mapping (shared_ptr, manages lifetime)      */
@@ -276,23 +313,35 @@ struct BamBuffer {
     size_t    n_pages;      /* Number of controller-page-sized pages            */
     size_t    page_size;    /* Controller page size in bytes                    */
 
+    /* PRP list pool (only allocated when prp_pool_size > 0) */
+    DmaPtr       prp_list_dma;          /* DMA mapping for PRP list pages          */
+    BufferPtr    prp_list_ioaddrs_buf;  /* Device copy of PRP list ioaddrs         */
+    BufferPtr    prp_slots_buf;         /* Device copy of allocator lock-bit array  */
+    uint32_t     prp_pool_size_;        /* Number of PRP list slots                */
+
+    /* Device-side descriptor (always allocated) */
+    BufferPtr    d_buf_mem;             /* Device memory backing the bam_buf_t     */
+    bam_buf_t*   d_buf;                /* Device pointer (pass to kernel args)     */
+
     /*
      * Construct a BamBuffer on a specific CUDA device.
      *
-     * Allocates GPU memory, creates a DMA mapping, and copies the
-     * IO address array to device memory for kernel access.
-     *
-     * @ctrl        Pointer to the libnvm controller handle.
-     * @total_size  Total buffer size in bytes (will be page-aligned).
-     * @cudaDevice  CUDA device ordinal for the allocation.
+     * @ctrl           Pointer to the libnvm controller handle.
+     * @total_size     Total buffer size in bytes (will be page-aligned).
+     * @cudaDevice     CUDA device ordinal for the allocation.
+     * @prp_pool_size  Number of PRP list slots for multi-page I/O (0=disabled).
      */
-    inline BamBuffer(const nvm_ctrl_t* ctrl, size_t total_size, int cudaDevice)
+    inline BamBuffer(const nvm_ctrl_t* ctrl, size_t total_size, int cudaDevice,
+                     uint32_t prp_pool_size = 0)
         : dma(createDma(ctrl, total_size, cudaDevice))
         , d_ioaddrs(nullptr)
         , vaddr(dma->vaddr)
         , n_pages(dma->n_ioaddrs)
         , page_size(dma->page_size)
+        , prp_pool_size_(prp_pool_size)
+        , d_buf(nullptr)
     {
+        /* Copy data page ioaddrs to device memory */
         size_t addrs_size = n_pages * sizeof(uint64_t);
         cudaError_t err = cudaMalloc((void**)&d_ioaddrs, addrs_size);
         if (err != cudaSuccess)
@@ -309,13 +358,68 @@ struct BamBuffer {
                 std::string("BamBuffer: failed to copy ioaddrs to device: ")
                 + cudaGetErrorString(err));
         }
+
+        /* Allocate PRP list pool if requested */
+        uint64_t* d_prp_list_ioaddrs = nullptr;
+        uint8_t*  d_prp_list_base = nullptr;
+        padded_struct* d_prp_slots = nullptr;
+
+        if (prp_pool_size_ > 0)
+        {
+            /* DMA-mapped GPU memory for PRP list pages */
+            prp_list_dma = createDma(ctrl, page_size * prp_pool_size_, cudaDevice);
+            d_prp_list_base = (uint8_t*)prp_list_dma->vaddr;
+
+            /* Copy PRP list page ioaddrs to device */
+            prp_list_ioaddrs_buf = createBuffer(
+                prp_list_dma->n_ioaddrs * sizeof(uint64_t), cudaDevice);
+            d_prp_list_ioaddrs = (uint64_t*)prp_list_ioaddrs_buf.get();
+            err = cudaMemcpy(d_prp_list_ioaddrs, prp_list_dma->ioaddrs,
+                             prp_list_dma->n_ioaddrs * sizeof(uint64_t),
+                             cudaMemcpyHostToDevice);
+            if (err != cudaSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("BamBuffer: failed to copy PRP list ioaddrs: ")
+                    + cudaGetErrorString(err));
+            }
+
+            /* Allocator lock-bit array (zeroed = all UNLOCKED) */
+            prp_slots_buf = createBuffer(
+                prp_pool_size_ * sizeof(padded_struct), cudaDevice);
+            d_prp_slots = (padded_struct*)prp_slots_buf.get();
+        }
+
+        /* Build and upload bam_buf_t device descriptor */
+        d_buf_mem = createBuffer(sizeof(bam_buf_t), cudaDevice);
+        d_buf = (bam_buf_t*)d_buf_mem.get();
+
+        bam_buf_t host_desc;
+        memset(&host_desc, 0, sizeof(host_desc));
+        host_desc.ioaddrs          = d_ioaddrs;
+        host_desc.base_addr        = (uint8_t*)vaddr;
+        host_desc.page_size        = (uint32_t)page_size;
+        host_desc.n_pages          = (uint32_t)n_pages;
+        host_desc.prp_list_ioaddrs = d_prp_list_ioaddrs;
+        host_desc.prp_list_base    = d_prp_list_base;
+        host_desc.prp_slots        = d_prp_slots;
+        host_desc.prp_pool_size    = prp_pool_size_;
+        host_desc.prp_page_size    = (uint32_t)page_size;
+
+        err = cudaMemcpy(d_buf, &host_desc, sizeof(bam_buf_t), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(
+                std::string("BamBuffer: failed to upload device descriptor: ")
+                + cudaGetErrorString(err));
+        }
     }
 
     /*
      * Convenience constructor: extract ctrl handle and CUDA device
      * from a Controller object.
      */
-    inline BamBuffer(Controller& ctrl, size_t total_size);
+    inline BamBuffer(Controller& ctrl, size_t total_size, uint32_t prp_pool_size = 0);
 
     inline ~BamBuffer()
     {
@@ -326,7 +430,7 @@ struct BamBuffer {
     /* Returns the GPU virtual address where data can be read/written. */
     void* data() const { return vaddr; }
 
-    /* Non-copyable (d_ioaddrs is a raw allocation). */
+    /* Non-copyable (owns raw GPU allocations). */
     BamBuffer(const BamBuffer&) = delete;
     BamBuffer& operator=(const BamBuffer&) = delete;
 };

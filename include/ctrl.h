@@ -272,8 +272,8 @@ inline void Controller::reserveQueues(uint16_t numSubs, uint16_t numCpls)
  * BamBuffer convenience constructor -- Extract ctrl handle and CUDA device
  * from a Controller object.
  */
-inline BamBuffer::BamBuffer(Controller& ctrl, size_t total_size)
-    : BamBuffer(ctrl.ctrl, total_size, ctrl.deviceId)
+inline BamBuffer::BamBuffer(Controller& ctrl, size_t total_size, uint32_t prp_pool_size)
+    : BamBuffer(ctrl.ctrl, total_size, ctrl.deviceId, prp_pool_size)
 {
 }
 
