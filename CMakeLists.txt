@@ -316,3 +316,7 @@ if (NOT no_fio AND sisci_include AND sisci_lib)
     add_custom_target (fio DEPENDS libnvmfio)
 endif ()
 
+# BaM I/O tests
+if (CUDA_FOUND AND NOT no_cuda)
+  add_subdirectory ("${PROJECT_SOURCE_DIR}/tests")
+endif ()
